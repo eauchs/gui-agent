@@ -1,0 +1,1280 @@
+import math
+
+import os
+
+import time
+
+import tkinter as tk
+
+from tkinter import Label
+
+import pyautogui
+
+from PIL import Image, ImageGrab
+
+from pynput.mouse import Controller as MouseController
+
+from rich import print
+
+from rich.prompt import Prompt
+
+import base64
+
+import io
+
+import re
+
+import unicodedata
+
+
+
+try:
+
+    from openai import OpenAI
+
+except ImportError:
+
+    print("[bold red]Fatal Error: OpenAI library not found. Please install it.[/bold red]")
+
+    print("Run: pip install openai")
+
+    exit()
+
+
+
+try:
+
+    import sounddevice as sd
+
+    import soundfile as sf
+
+    AUDIO_ENABLED = True
+
+except ImportError:
+
+    print("[yellow]Warning: sounddevice or soundfile not found. Audio feedback will be disabled.[/yellow]")
+
+    AUDIO_ENABLED = False
+
+
+
+try:
+
+    SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
+
+except Exception as e:
+
+    print(f"[red]Error getting screen_size via pyautogui: {e}[/red]")
+
+    print("[yellow]Defaulting to 1920x1080. Adjust if necessary.[/yellow]")
+
+    SCREEN_WIDTH, SCREEN_HEIGHT = 1920, 1080
+
+
+
+OVERLAY_DURATION = 0.8
+
+HIGHLIGHT_DURATION = 0.15
+
+CURSOR_ANIMATION_DURATION = 0.2
+
+mouse_controller = MouseController()
+
+
+
+OPENAI_API_BASE_URL = "http://localhost:1234/v1"
+
+OPENAI_API_KEY = "lm-studio"
+
+VLM_MODEL_NAME_FOR_API = "ui-tars-1.5-7b" # Revenu à ce modèle, meilleur pour JSON
+
+
+
+try:
+
+    client = OpenAI(base_url=OPENAI_API_BASE_URL, api_key=OPENAI_API_KEY)
+
+except Exception as e:
+
+    print(f"[bold red]Fatal Error: Could not initialize OpenAI client: {e}[/bold red]")
+
+    exit()
+
+
+
+# --- NOUVEAU Prompt Système pour Séquence d'Actions ---
+
+ACTION_SPACE_DEFINITION_SEQUENCED = f"""
+
+You are a hyper-precise AI assistant specialized in controlling a macOS GUI by planning SEQUENCES of actions.
+
+Your screen resolution is {SCREEN_WIDTH}x{SCREEN_HEIGHT}.
+
+
+
+CRITICAL INSTRUCTION: YOUR ENTIRE RESPONSE MUST BE A SINGLE, VALID JSON OBJECT STRING.
+
+NO EXPLANATORY TEXT. ONLY THE JSON OBJECT.
+
+The JSON object MUST include a "global_thought" key AND an "action_sequence" key.
+
+
+
+The "global_thought" key is MANDATORY. Its value MUST be an object following this exact 7-point structure,
+
+describing your overall reasoning for the ENTIRE action_sequence:
+
+1.  **Current State Summary:** Summarize task progress so far.
+
+2.  **User's Overall Task:** Restate the user's high-level goal.
+
+3.  **Previous Action Assessment:** Assess the OUTCOME of the PREVIOUS action_sequence (from history, if any). Was the entire previous sequence successful? Did it achieve its sub-goal?
+
+4.  **Current Screen Analysis (Brief):** Describe the current screenshot relevant to the NEXT sequence.
+
+5.  **Next Immediate Sub-goal:** State the specific sub-goal this ENTIRE action_sequence aims to achieve.
+
+6.  **Action Justification & Selection:** Justify WHY this specific action_sequence (and its micro-actions) is the most appropriate to achieve the sub-goal. Explain the purpose of the sequence.
+
+7.  **Anticipated Next Step:** Describe what you expect AFTER the ENTIRE action_sequence is executed.
+
+
+
+The "action_sequence" key is MANDATORY. Its value MUST be a LIST of "micro-action" objects.
+
+Each micro-action object in the list MUST have an "action_type" and its required parameters.
+
+Each micro-action object SHOULD also include a "description" field: a brief string explaining the purpose of that specific micro-step.
+
+
+
+Available "action_type" values for micro-actions and their JSON Format:
+
+
+
+1.  `{{"action_type": "CLICK", "position": [norm_x, norm_y], "description": "Click the login button."}}`
+
+    * "position" MUST be normalized floats [0.0-1.0].
+
+
+
+2.  `{{"action_type": "DOUBLE_CLICK", "position": [norm_x, norm_y], "description": "Open 'mydoc.txt'."}}`
+
+
+
+3.  `{{"action_type": "INPUT", "value": "text_to_type", "position": [norm_x, norm_y_optional], "description": "Type username."}}`
+
+    * "position" is where to click before typing. If omitted, types into the currently focused field. For Spotlight, after opening it, a position might not be needed if it's auto-focused. Use your judgment.
+
+
+
+4.  `{{"action_type": "SCROLL", "direction": "up" or "down", "description": "Scroll down to find button."}}`
+
+
+
+5.  `{{"action_type": "PRESS_ENTER", "description": "Submit the form."}}`
+
+
+
+6.  `{{"action_type": "KEY_PRESS", "keys": ["modifier1", "key"], "description": "Copy selected text."}}`
+
+    * "keys" MUST be a list of strings (e.g., ["COMMAND", "SPACE"], NOT ["COMMAND SPACE"]).
+
+
+
+7.  `{{"action_type": "PAUSE", "duration_seconds": float_value, "description": "Wait for UI to update."}}`
+
+    * "duration_seconds" is a float (e.g., 0.5 for half a second). Use for brief waits for UI elements to appear or stabilize.
+
+
+
+8.  `{{"action_type": "FINISHED", "reason": "Brief reason.", "description": "Task is fully complete."}}`
+
+    * If present, this MUST be the ONLY micro-action in the sequence.
+
+
+
+EXAMPLE of a sequence to open Spotlight and type "Chrome":
+
+`{{
+
+    "global_thought": {{
+
+        "Current State Summary": "Desktop is visible. No previous sequence.",
+
+        "User's Overall Task": "Open Chrome.",
+
+        "Previous Action Assessment": "None.",
+
+        "Current Screen Analysis (Brief)": "Desktop view, Chrome not open.",
+
+        "Next Immediate Sub-goal": "Launch Chrome using Spotlight.",
+
+        "Action Justification & Selection": "This sequence opens Spotlight, types 'Chrome', waits, then presses Enter to launch it.",
+
+        "Anticipated Next Step": "Chrome application window should appear."
+
+    }},
+
+    "action_sequence": [
+
+        {{"action_type": "KEY_PRESS", "keys": ["COMMAND", "SPACE"], "description": "Open Spotlight search."}},
+
+        {{"action_type": "PAUSE", "duration_seconds": 0.5, "description": "Wait for Spotlight to open."}},
+
+        {{"action_type": "INPUT", "value": "Chrome", "description": "Type 'Chrome' into Spotlight."}}, 
+
+        {{"action_type": "PAUSE", "duration_seconds": 1.0, "description": "Wait for search results to appear."}},
+
+        {{"action_type": "PRESS_ENTER", "description": "Press Enter to launch selected application (Chrome)."}}
+
+    ]
+
+}}`
+
+
+
+--- macOS Keyboard Shortcuts (Remain the same) ---
+
+* `Command+Space`: Show or hide the Spotlight search field. (This is a TOGGLE. Use PAUSE after it.)
+
+---
+
+
+
+CRITICAL REMINDERS:
+
+* If Spotlight is opened with `KEY_PRESS ["COMMAND", "SPACE"]`, use a `PAUSE` before attempting to `INPUT` into it.
+
+* Your `global_thought` must justify the entire sequence. Each micro-action's `description` explains its specific role.
+
+* Ensure parameters are correct for each `action_type` (e.g., `value` for `INPUT`, `keys` for `KEY_PRESS`, `duration_seconds` for `PAUSE`).
+
+"""
+
+MAIN_SYSTEM_PROMPT = ACTION_SPACE_DEFINITION_SEQUENCED
+
+
+
+# --- Fonctions Utilitaires pour l'Overlay et l'Animation du Curseur ---
+
+# (Assurez-vous que les imports nécessaires comme tk, math, pyautogui, MouseController sont faits)
+
+
+
+def animate_cursor_movement(start_x, start_y, end_x, end_y, duration=CURSOR_ANIMATION_DURATION):
+
+    steps = int(duration * 100); steps = max(1, steps)
+
+    for i in range(steps + 1):
+
+        t = i / steps; x = start_x + (end_x - start_x) * t; y = start_y + (end_y - start_y) * t
+
+        try: mouse_controller.position = (x, y)
+
+        except: pyautogui.moveTo(x,y, duration=duration/steps/2) # Fallback
+
+        time.sleep(duration / steps)
+
+
+
+def highlight_click_position(x, y, duration=HIGHLIGHT_DURATION):
+
+    current_pos = pyautogui.position()
+
+    animate_cursor_movement(current_pos[0], current_pos[1], x, y)
+
+    radius, steps, center_x, center_y = 7, 8, x, y
+
+    for i in range(steps +1 ):
+
+        angle = 2 * math.pi * i / steps; new_x, new_y = center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)
+
+        try: mouse_controller.position = (new_x, new_y)
+
+        except: pyautogui.moveTo(new_x, new_y, duration=duration/(steps+1)/2) # Fallback
+
+        time.sleep(duration / (steps+1))
+
+    try: mouse_controller.position = (x, y)
+
+    except: pyautogui.moveTo(x,y) # Fallback
+
+
+
+def create_action_overlay(action_text, x, y, color="lime", duration=OVERLAY_DURATION):
+
+    try:
+
+        root = tk.Tk(); root.overrideredirect(True); root.attributes("-topmost", True); root.attributes("-alpha", 0.75); root.config(bg="black")
+
+        offset_x, offset_y = 25, 25; screen_w,screen_h = root.winfo_screenwidth(),root.winfo_screenheight()
+
+        lines = action_text.split('\n')
+
+        max_line_len = 0
+
+        if lines: # Vérifier si lines n'est pas vide
+
+            max_line_len = max(len(line) for line in lines) if lines else 0 # S'assurer que lines n'est pas vide pour max()
+
+        
+
+        approx_text_width = max_line_len * 9 # Estimation de la largeur
+
+        approx_text_height = len(lines) * 22 # Estimation de la hauteur
+
+        
+
+        overlay_width = approx_text_width + 20; overlay_height =    approx_text_height + 10
+
+        overlay_x = min(max(0, x + offset_x), screen_w - overlay_width)
+
+        overlay_y = min(max(0, y + offset_y), screen_h - overlay_height)
+
+        root.geometry(f"{overlay_width}x{overlay_height}+{int(overlay_x)}+{int(overlay_y)}")
+
+        label = Label(root, text=action_text, fg=color, bg="black", font=("Arial", 12, "bold"), justify=tk.LEFT)
+
+        label.pack(padx=10, pady=5, expand=True, fill='both')
+
+        # Utiliser une lambda pour s'assurer que winfo_exists est appelé au moment de l'exécution de after
+
+        root.after(int(duration * 1000), lambda: root.destroy() if root.winfo_exists() else None)
+
+        root.update(); return root
+
+    except Exception as e:
+
+        print(f"[yellow]Warning: Could not create overlay: {e}. GUI actions will still be performed.[/yellow]")
+
+        return None # Retourner None pour que les fonctions appelantes puissent vérifier
+
+
+
+def safe_destroy_overlay(overlay_ref):
+
+    if overlay_ref and overlay_ref.winfo_exists(): # Vérifier si la référence existe et si la fenêtre existe
+
+        overlay_ref.destroy()
+
+
+
+# --- Fonctions d'Action GUI (Adaptées pour prendre 'description') ---
+
+def action_click(position_norm, description=""):
+
+    x, y = round(position_norm[0] * SCREEN_WIDTH), round(position_norm[1] * SCREEN_HEIGHT)
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print(f"Executing: CLICK at ({x}, {y})")
+
+    overlay = create_action_overlay(f"CLICK\n({x},{y})\n{description[:30]}", x, y)
+
+    highlight_click_position(x, y); pyautogui.click(x=x, y=y)
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_double_click(position_norm, description=""):
+
+    x, y = round(position_norm[0] * SCREEN_WIDTH), round(position_norm[1] * SCREEN_HEIGHT)
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print(f"Executing: DOUBLE_CLICK at ({x}, {y})")
+
+    overlay = create_action_overlay(f"DBL_CLICK\n({x},{y})\n{description[:30]}", x, y)
+
+    highlight_click_position(x, y); pyautogui.doubleClick(x=x, y=y, interval=0.1)
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_input_text(value_to_type, position_norm=None, description=""): # position_norm is now optional
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print(f"Executing: INPUT '{value_to_type}'")
+
+    overlay_x, overlay_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 # Default overlay position
+
+    if position_norm: # If position is provided, click there first
+
+        x, y = round(position_norm[0] * SCREEN_WIDTH), round(position_norm[1] * SCREEN_HEIGHT)
+
+        print(f"Clicking at ({x}, {y}) before typing.")
+
+        highlight_click_position(x, y); pyautogui.click(x=x, y=y); time.sleep(0.2)
+
+        overlay_x, overlay_y = x, y
+
+    overlay_text = f"TYPE:\n{value_to_type[:25]}{'...' if len(value_to_type) > 25 else ''}\n{description[:30]}"
+
+    overlay = create_action_overlay(overlay_text, overlay_x, overlay_y)
+
+    pyautogui.write(value_to_type, interval=0.03)
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_scroll(direction, description=""):
+
+    scroll_clicks = 10; amount = -scroll_clicks if direction.lower() == "up" else scroll_clicks
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print(f"Executing: SCROLL {direction.upper()}")
+
+    overlay = create_action_overlay(f"SCROLL {direction.upper()}\n{description[:30]}", SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+
+    pyautogui.scroll(amount)
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_press_enter(description=""):
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print("Executing: PRESS_ENTER")
+
+    overlay = create_action_overlay(f"ENTER\n{description[:30]}", SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+
+    pyautogui.press("enter")
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_key_press(keys_to_press_original, description=""):
+
+    print(f"[grey50]Action Description: {description}[/grey50]")
+
+    processed_keys_list = [] # Copied from your version
+
+    for key_item in keys_to_press_original:
+
+        if isinstance(key_item, str) and " " in key_item:
+
+            parts = key_item.lower().split()
+
+            if len(parts) > 1:
+
+                processed_keys_list.extend(parts)
+
+            else:
+
+                processed_keys_list.append(key_item.lower())
+
+        elif isinstance(key_item, str):
+
+             processed_keys_list.append(key_item.lower())
+
+        else: continue
+
+    if not processed_keys_list:
+
+        print(f"[red]Error: No valid keys after processing for KEY_PRESS. Original: {keys_to_press_original}[/red]")
+
+        if AUDIO_ENABLED: play_sound_feedback("error.wav"); return False # Indicate failure
+
+
+
+    pyautogui_keys = []
+
+    original_keys_for_display = list(keys_to_press_original)
+
+    for key_name_lower in processed_keys_list:
+
+        # (Your mapping logic from k_lower to pyautogui_keys - keep it as is)
+
+        if key_name_lower in ["command", "cmd"]: pyautogui_keys.append("command")
+
+        elif key_name_lower in ["option", "alt"]: pyautogui_keys.append("option")
+
+        elif key_name_lower in ["control", "ctrl"]: pyautogui_keys.append("ctrl")
+
+        # ... (tout votre mappage existant)
+
+        elif key_name_lower == "shift": pyautogui_keys.append("shift")
+
+        elif key_name_lower == "fn": continue # Ignorer FN
+
+        elif key_name_lower == "space": pyautogui_keys.append("space")
+
+        elif key_name_lower == "delete": pyautogui_keys.append("backspace")
+
+        elif key_name_lower in ["enter", "return"]: pyautogui_keys.append("enter")
+
+        elif key_name_lower == "tab": pyautogui_keys.append("tab")
+
+        elif key_name_lower in ["escape", "esc"]: pyautogui_keys.append("esc")
+
+        elif key_name_lower == "up_arrow": pyautogui_keys.append("up")
+
+        elif key_name_lower == "down_arrow": pyautogui_keys.append("down")
+
+        elif key_name_lower == "left_arrow": pyautogui_keys.append("left")
+
+        elif key_name_lower == "right_arrow": pyautogui_keys.append("right")
+
+        elif key_name_lower == "accentgrave": pyautogui_keys.append("`")
+
+        elif re.match(r"f\d{1,2}", key_name_lower): pyautogui_keys.append(key_name_lower)
+
+        elif len(key_name_lower) == 1 and (key_name_lower.isalnum() or key_name_lower in [',', '.', '/', ';', "'", '[', ']', '\\', '-', '=']):
+
+            pyautogui_keys.append(key_name_lower)
+
+        else:
+
+            print(f"[red]Warning: Unknown key '{key_name_lower}' in KEY_PRESS. Ignored. Original: {original_keys_for_display}[/red]")
+
+            continue
+
+
+
+    if not pyautogui_keys:
+
+        print(f"[red]Error: No valid PyAutoGUI keys to press after mapping. Original VLM keys: {original_keys_for_display}[/red]")
+
+        if AUDIO_ENABLED: play_sound_feedback("error.wav"); return False
+
+    
+
+    print(f"Executing: KEY_PRESS PyAutoGUI: {pyautogui_keys} (Original VLM: {original_keys_for_display})")
+
+    overlay = create_action_overlay(f"KEY_PRESS:\n{', '.join(original_keys_for_display)}\n{description[:30]}", SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2, color="orange")
+
+    try:
+
+        # (Votre logique existante pour hotkey vs keyDown/press/keyUp - keep it as is)
+
+        potential_modifiers = ["command", "option", "ctrl", "shift"]
+
+        all_but_last_are_modifiers = True
+
+        if len(pyautogui_keys) > 1:
+
+            for i in range(len(pyautogui_keys) - 1):
+
+                if pyautogui_keys[i] not in potential_modifiers:
+
+                    all_but_last_are_modifiers = False; break
+
+            if pyautogui_keys[-1] in potential_modifiers: all_but_last_are_modifiers = False
+
+        else: all_but_last_are_modifiers = False
+
+        if all_but_last_are_modifiers and len(pyautogui_keys) > 1 : pyautogui.hotkey(*pyautogui_keys)
+
+        elif len(pyautogui_keys) == 1: pyautogui.press(pyautogui_keys[0])
+
+        else:
+
+            actual_modifiers_to_hold = [k for k in pyautogui_keys if k in potential_modifiers]
+
+            keys_to_actually_press = [k for k in pyautogui_keys if k not in potential_modifiers]
+
+            if not keys_to_actually_press and actual_modifiers_to_hold:
+
+                for mod_key in actual_modifiers_to_hold: pyautogui.press(mod_key); time.sleep(0.05)
+
+            elif keys_to_actually_press:
+
+                for mod in actual_modifiers_to_hold: pyautogui.keyDown(mod)
+
+                time.sleep(0.05)
+
+                for main_k in keys_to_actually_press: pyautogui.press(main_k); time.sleep(0.05)
+
+                time.sleep(0.05)
+
+                for mod in reversed(actual_modifiers_to_hold): pyautogui.keyUp(mod)
+
+            else: print(f"[red]Error: No keys to execute for KEY_PRESS {original_keys_for_display}[/red]"); return False
+
+        if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay)); return True # Success
+
+    except Exception as e:
+
+        print(f"[bold red]Error during KEY_PRESS: {e}[/bold red]")
+
+        if AUDIO_ENABLED: play_sound_feedback("error.wav");
+
+        if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay)); return False # Failure
+
+
+
+def action_pause(duration_seconds, description=""):
+
+    print(f"[grey50]Action Description: {description}[/grey50]"); print(f"Executing: PAUSE for {duration_seconds}s")
+
+    overlay = create_action_overlay(f"PAUSE {duration_seconds}s\n{description[:30]}", SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2, color="blue")
+
+    time.sleep(float(duration_seconds))
+
+    if overlay: overlay.after(200, lambda: safe_destroy_overlay(overlay))
+
+
+
+def action_finished(reason="Task seems complete.", description=""): # description vient de la micro-action
+
+    # La pensée globale sera affichée par la boucle principale avant d'appeler ceci.
+
+    print(f"[grey50]Action Description: {description}[/grey50]")
+
+    print(f"[bold green]Action: FINISHED. Reason: {reason}[/bold green]")
+
+    if AUDIO_ENABLED: play_sound_feedback("task_completed.wav")
+
+
+
+# --- Fonctions de l'Agent (image_to_base64_url reste la même) ---
+
+def image_to_base64_url(image_path, format="PNG"):
+
+    try:
+
+        with Image.open(image_path) as img:
+
+            if format.upper() == "JPEG" and (img.mode == 'RGBA' or img.mode == 'LA' or img.mode == 'P'):
+
+                img = img.convert('RGB')
+
+            elif format.upper() == "PNG" and img.mode not in ['RGB', 'RGBA', 'L', 'LA', 'P']:
+
+                if img.mode != 'P': img = img.convert('RGBA')
+
+            buffered = io.BytesIO(); img.save(buffered, format=format)
+
+            return f"data:image/{format.lower()};base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
+
+    except Exception as e: print(f"[red]Error encoding image {image_path}: {e}[/red]"); return None
+
+
+
+# --- NOUVEAU Parseur pour Séquence d'Actions ---
+
+def parse_vlm_output_to_sequence(vlm_response_str: str):
+
+    json_str_to_parse = None
+
+    cleaned_str = vlm_response_str.strip()
+
+    json_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", cleaned_str, re.DOTALL)
+
+    if json_match:
+
+        json_str_to_parse = json_match.group(1)
+
+        print("[grey50]Extracted JSON from Markdown code block.[/grey50]")
+
+    else:
+
+        first_brace = cleaned_str.find('{'); last_brace = cleaned_str.rfind('}')
+
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+
+            json_str_to_parse = cleaned_str[first_brace : last_brace + 1]
+
+            print("[grey50]Extracted JSON using first/last brace logic.[/grey50]")
+
+        else:
+
+            print(f"[red]Error: No JSON structure found in VLM response: {cleaned_str[:200]}[/red]"); return None
+
+    try:
+
+        cleaned_for_parsing = "".join(ch for ch in json_str_to_parse if unicodedata.category(ch)[0] != "C" or ch in ('\t', '\n', '\r'))
+
+        decoder = json.JSONDecoder()
+
+        decoded_data, end_index = decoder.raw_decode(cleaned_for_parsing)
+
+        remaining_data = cleaned_for_parsing[end_index:].strip()
+
+        if remaining_data:
+
+            print(f"[yellow]Warning: Extra data after first JSON object. Using only first. Extra: '{remaining_data[:100]}...'[/yellow]")
+
+        
+
+        if not isinstance(decoded_data, dict):
+
+            print(f"[red]Error: Decoded JSON is not a dictionary. Type: {type(decoded_data)}[/red]"); return None
+
+
+
+        global_thought = decoded_data.get("global_thought")
+
+        action_sequence = decoded_data.get("action_sequence")
+
+
+
+        if global_thought is None: print("[red]Error: 'global_thought' key missing.[/red]"); return None
+
+        if not isinstance(global_thought, dict): print("[red]Error: 'global_thought' is not an object.[/red]"); return None
+
+        # Valider les 7 points du global_thought
+
+        required_thought_keys = ["Current State Summary", "User's Overall Task", "Previous Action Assessment",
+
+                                 "Current Screen Analysis (Brief)", "Next Immediate Sub-goal",
+
+                                 "Action Justification & Selection", "Anticipated Next Step"]
+
+        for r_key in required_thought_keys:
+
+            if r_key not in global_thought:
+
+                print(f"[red]Error: 'global_thought' is missing key: '{r_key}'[/red]"); return None
+
+
+
+
+
+        if action_sequence is None: print("[red]Error: 'action_sequence' key missing.[/red]"); return None
+
+        if not isinstance(action_sequence, list): print("[red]Error: 'action_sequence' is not a list.[/red]"); return None
+
+        if not action_sequence and global_thought.get("Next Immediate Sub-goal", "").lower() != "task is finished": # Séquence vide seulement si FINISHED
+
+             # Permettre une séquence vide si l'action est "FINISHED" (implicitement)
+
+             # ou si le VLM a une raison de ne rien faire (ce qui devrait être dans 'FINISHED')
+
+             is_finish_implied = any(micro_action.get("action_type") == "FINISHED" for micro_action in action_sequence if isinstance(micro_action, dict))
+
+             if not is_finish_implied :
+
+                print("[red]Error: 'action_sequence' is empty, but no FINISHED action was specified and sub-goal implies action.[/red]"); return None
+
+
+
+
+
+        validated_sequence = []
+
+        for i, micro_action in enumerate(action_sequence):
+
+            if not isinstance(micro_action, dict):
+
+                print(f"[red]Error: Micro-action {i} is not an object.[/red]"); return None
+
+            action_type = micro_action.get("action_type")
+
+            description = micro_action.get("description", f"Step {i+1} in sequence.") # Fournir un défaut
+
+            micro_action["description"] = description # S'assurer qu'il est là
+
+
+
+            if not action_type: print(f"[red]Error: Micro-action {i} missing 'action_type'.[/red]"); return None
+
+            
+
+            valid_action_types = ["CLICK", "DOUBLE_CLICK", "INPUT", "SCROLL", "PRESS_ENTER", "KEY_PRESS", "PAUSE", "FINISHED"]
+
+            if action_type not in valid_action_types:
+
+                print(f"[red]Error: Micro-action {i} has unknown 'action_type': {action_type}[/red]"); return None
+
+
+
+            if action_type in ["CLICK", "DOUBLE_CLICK"] and "position" not in micro_action:
+
+                print(f"[red]Error: Micro-action {i} ({action_type}) missing 'position'.[/red]"); return None
+
+            if action_type == "INPUT":
+
+                if "value" not in micro_action: print(f"[red]Error: Micro-action {i} (INPUT) missing 'value'.[/red]"); return None
+
+                # Position est optionnelle pour INPUT, si omise, pyautogui tape là où est le focus
+
+                if "position" in micro_action and micro_action["position"] is not None: # Valider position si fournie
+
+                    pos = micro_action["position"]
+
+                    if not (isinstance(pos, list) and len(pos) == 2): print(f"[red]Error validating INPUT position for micro-action {i}[/red]");return None
+
+            if action_type == "SCROLL" and "direction" not in micro_action:
+
+                print(f"[red]Error: Micro-action {i} (SCROLL) missing 'direction'.[/red]"); return None
+
+            if action_type == "KEY_PRESS":
+
+                if "keys" not in micro_action: print(f"[red]Error: Micro-action {i} (KEY_PRESS) missing 'keys'.[/red]"); return None
+
+                if not isinstance(micro_action.get("keys"), list):print(f"[red]Error: Micro-action {i} (KEY_PRESS) 'keys' must be a list.[/red]"); return None
+
+            if action_type == "PAUSE":
+
+                if "duration_seconds" not in micro_action: print(f"[red]Error: Micro-action {i} (PAUSE) missing 'duration_seconds'.[/red]"); return None
+
+                try: float(micro_action["duration_seconds"])
+
+                except ValueError: print(f"[red]Error: Micro-action {i} (PAUSE) 'duration_seconds' not a valid float.[/red]"); return None
+
+            if action_type == "FINISHED" and "reason" not in micro_action:
+
+                micro_action["reason"] = "Task sequence marked as finished."
+
+            
+
+            # Valider et normaliser "position" pour les actions qui l'utilisent
+
+            if "position" in micro_action and micro_action["position"] is not None:
+
+                pos = micro_action["position"]
+
+                if not (isinstance(pos, list) and len(pos) == 2 and all(isinstance(p, (float, int, str)) for p in pos)):
+
+                     print(f"[red]Error: Invalid 'position' format for micro_action {i}: {pos}[/red]"); return None
+
+                try:
+
+                    raw_x, raw_y = float(pos[0]), float(pos[1])
+
+                    norm_x, norm_y = raw_x, raw_y
+
+                    if not (0.0 <= raw_x <= 1.0 and 0.0 <= raw_y <= 1.0):
+
+                        if (isinstance(pos[0],int) and abs(pos[0])>1) or (isinstance(pos[1],int) and abs(pos[1])>1) or abs(raw_x)>1.0 or abs(raw_y)>1.0:
+
+                            norm_x = raw_x / SCREEN_WIDTH; norm_y = raw_y / SCREEN_HEIGHT
+
+                    micro_action["position"] = [max(0.0, min(1.0, norm_x)), max(0.0, min(1.0, norm_y))]
+
+                except ValueError: print(f"[red]Error: Could not convert position for micro_action {i}: {pos}[/red]"); return None
+
+            validated_sequence.append(micro_action)
+
+        
+
+        return {"global_thought": global_thought, "action_sequence": validated_sequence}
+
+
+
+    except json.JSONDecodeError as e:
+
+        print(f"[red]JSONDecodeError: {e}. Attempted to parse (after cleaning): '{cleaned_for_parsing[:300]}...'[/red]"); return None
+
+    except Exception as e:
+
+        print(f"[red]Unexpected error in parse_vlm_output_to_sequence: {e}. Input: '{cleaned_str[:200]}...'[/red]"); return None
+
+
+
+# --- build_messages_for_api (Adapté pour l'historique des séquences) ---
+
+def build_messages_for_api(system_prompt_content, user_task, image_base64_url, history_sequences_thoughts=None):
+
+    user_text_content = f"User's Current Task: {user_task}"
+
+
+
+    if history_sequences_thoughts:
+
+        user_text_content += "\n\n--- Previous Interaction History (Your Past Sequences & Thoughts) ---"
+
+        for i, (prev_sequence_data_str, prev_vlm_raw_resp_str) in enumerate(history_sequences_thoughts):
+
+            try:
+
+                parsed_prev_data = json.loads(prev_action_dict_str) # prev_action_dict_str est le JSON de l'historique
+
+                prev_global_thought = parsed_prev_data.get("global_thought", {}) # Obtenir la pensée globale
+
+                prev_action_sequence_summary = "..." # Votre résumé de la séquence
+
+
+
+            # Point clé : Vérifier si l'entrée de l'historique était une erreur d'agent
+
+                if parsed_prev_data.get("action_type") == "ERROR_FROM_AGENT":
+
+                    error_detail_hist = parsed_prev_data.get("detail", "Unknown agent error.")
+
+                    user_text_content += f"\n{i+1}. CRITICAL NOTE: Your PREVIOUSLY PLANNED sequence FAILED due to an agent-side execution error: '{error_detail_hist}'."
+
+                    user_text_content += f"\n   Therefore, the sequence described below was NOT fully executed. You must re-evaluate the current screen based on this failure."
+
+                # La pensée globale de l'erreur contient déjà "Previous Action Assessment":f"Critical error: {error_detail}"
+
+                    thought_summary_for_history = f"AGENT ERROR: {error_detail_hist}"
+
+                else:
+
+                # Formatage normal de la pensée globale et de la séquence
+
+                    pa_assessment = prev_global_thought.get("Previous Action Assessment", "N/A")
+
+                    thought_summary_for_history = f"Overall Sub-goal: {prev_global_thought.get('Next Immediate Sub-goal', 'N/A')}. Assessment of Last Sequence: {str(pa_assessment).replace(chr(10), ' ')}"
+
+            
+
+                user_text_content += f"\n{i+1}. Your Previous Global Thought Context: {thought_summary_for_history}"
+
+                user_text_content += f"\n   Your Previous Action Sequence (may have failed): {prev_action_sequence_summary}" # prev_action_sequence_summary à définir
+
+# ...
+
+                
+
+                if parsed_prev_data.get("action_type") == "ERROR_FROM_AGENT": # Si vous stockez des erreurs d'agent
+
+                     user_text_content += f"\n   IMPORTANT_OUTCOME: The previous step resulted in an agent-side error: {parsed_prev_data.get('detail')}. Your last sequence might not have completed."
+
+
+
+            except Exception as e:
+
+                user_text_content += f"\n{i+1}. Note: Could not fully parse prev sequence data for history: {prev_sequence_data_str[:100]}"
+
+    else:
+
+        user_text_content += "\n\n--- Previous Interaction History: None (This is the first sequence) ---"
+
+
+
+    # Les KEY INSTRUCTIONS doivent être adaptées pour les séquences si besoin, ou simplifiées.
+
+    # Pour l'instant, on se fie au prompt système principal qui détaille le format de la séquence.
+
+    user_text_content += "\n\n--- Current Situation ---"
+
+    user_text_content += "\nPlan your NEXT 'action_sequence' and 'global_thought' based on the screen and history."
+
+    user_text_content += "\nRemember, 'Command+Space' TOGGLES Spotlight. Use PAUSES effectively."
+
+
+
+    messages = [{"role": "system", "content": system_prompt_content}, {"role": "user", "content": [{"type": "text", "text": user_text_content}]}]
+
+    if image_base64_url:
+
+        messages[1]["content"].append({"type": "image_url", "image_url": {"url": image_base64_url, "detail": "auto"}})
+
+    return messages
+
+
+
+# --- Boucle Principale de l'Agent (Adaptée pour les Séquences) ---
+
+def main_agent_loop():
+
+    print("[bold blue]Screen Navigation Assistant (Sequenced Actions Mode)[/bold blue]")
+
+    print(f"Using API Base: {OPENAI_API_BASE_URL}")
+
+    print(f"Using Model (via API): {VLM_MODEL_NAME_FOR_API}")
+
+    print(f"Screen resolution: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
+
+    print("Type 'exit' to quit.")
+
+
+
+    current_task_query = ""
+
+    # interaction_history stocke des tuples de (string_json_de_sequence_et_pensee, reponse_brute_vlm)
+
+    interaction_history = []
+
+    screenshots_dir = "agent_gui_screenshots_api"; os.makedirs(screenshots_dir, exist_ok=True)
+
+    
+
+
+
+    max_steps_per_task = 20; current_step = 0
+
+
+
+    while True:
+
+        if current_task_query.lower() == "exit": print("Exiting agent."); break
+
+        if not current_task_query:
+
+            current_task_query = Prompt.ask("\nWhat would you like me to do next? (or type 'exit')")
+
+            interaction_history = []; current_step = 0
+
+            if current_task_query.lower() == "exit": print("Exiting agent."); break
+
+            if not current_task_query: continue
+
+
+
+        current_step += 1
+
+        print(f"\n[bold magenta]Current Task:[/] {current_task_query}")
+
+        print(f"Starting step {current_step}/{max_steps_per_task} (a step may involve multiple micro-actions)...")
+
+
+
+        if current_step > max_steps_per_task:
+
+            print("[bold red]Max steps reached. Please provide a new task.[/bold red]")
+
+            if AUDIO_ENABLED: play_sound_feedback("error.wav")
+
+            current_task_query = ""; interaction_history = []; current_step = 0; continue
+
+        
+
+        time.sleep(0.99) # Pause avant screenshot (après la séquence précédente)
+
+        
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+
+        screenshot_path = os.path.join(screenshots_dir, f"step_{current_step}_{timestamp}.png")
+
+        try:
+
+            ImageGrab.grab().save(screenshot_path); print(f"Screenshot saved to {screenshot_path}")
+
+        except Exception as e:
+
+            print(f"[red]Error taking screenshot: {e}[/red]")
+
+            interaction_history.append( (json.dumps({"action_type": "ERROR_FROM_AGENT", "detail": f"Screenshot err: {str(e)[:50]}", "global_thought": {"Previous Action Assessment":"Screenshot failed"}}), "N/A_ScreenshotError") )
+
+            continue
+
+
+
+        image_b64_url = image_to_base64_url(screenshot_path)
+
+        if not image_b64_url:
+
+            print("[red]Failed to encode screenshot.[/red]")
+
+            interaction_history.append( (json.dumps({"action_type": "ERROR_FROM_AGENT", "detail": "Image encode fail", "global_thought": {"Previous Action Assessment":"Image encode failed"}}), "N/A_EncodingError") )
+
+            continue
+
+
+
+        # --- Logique de Détection de Boucle (Simplifiée pour les séquences) ---
+
+        system_prompt_for_api = MAIN_SYSTEM_PROMPT
+
+        if len(interaction_history) >= 2:
+
+            try:
+
+                last_hist_item_str, _ = interaction_history[-1]
+
+                second_last_hist_item_str, _ = interaction_history[-2]
+
+                last_data = json.loads(last_hist_item_str)
+
+                second_last_data = json.loads(second_last_hist_item_str)
+
+
+
+                # Comparer les séquences d'actions
+
+                if last_data.get("action_sequence") and last_data.get("action_sequence") == second_last_data.get("action_sequence"):
+
+                    warning_note = (
+
+                        f"\n\n--- CRITICAL SYSTEM NOTE: REPETITIVE ACTION SEQUENCE DETECTED ---\n"
+
+                        f"You have proposed the exact same 'action_sequence' at least twice in a row: {json.dumps(last_data.get('action_sequence'))}\n"
+
+                        "This indicates you are stuck or the previous sequence did not achieve its goal as expected.\n"
+
+                        "IMMEDIATE CORRECTIVE ACTIONS REQUIRED:\n"
+
+                        "1.  In your 'global_thought.Previous Action Assessment': Explain WHY the previous identical sequence failed or did not suffice.\n"
+
+                        "2.  Your new 'action_sequence' MUST BE DIFFERENT or your 'global_thought' must provide an exceptionally strong reason for retrying the exact same sequence.\n"
+
+                        "3.  Consider if the UI state changed unexpectedly or if a different approach entirely is needed.\n"
+
+                        "--- END OF CRITICAL SYSTEM NOTE ---"
+
+                    )
+
+                    system_prompt_for_api += warning_note
+
+                    print(f"[bold red]LOOP DETECTED:[/bold red] VLM repeated an action sequence. Adding CRITICAL NOTE.")
+
+                    if AUDIO_ENABLED: play_sound_feedback("error.wav")
+
+            except Exception as e: print(f"[grey50]Error in loop detection for sequences: {e}[/grey50]")
+
+        # --- Fin Détection de Boucle ---
+
+
+
+        api_messages = build_messages_for_api(system_prompt_for_api, current_task_query, image_b64_url, interaction_history)
+
+        
+
+        vlm_full_response_str = ""; parsed_vlm_data = None
+
+        try:
+
+            print(f"Sending request to VLM API (model: {VLM_MODEL_NAME_FOR_API})...")
+
+            chat_completion_params = {
+
+                "model": VLM_MODEL_NAME_FOR_API, "messages": api_messages,
+
+                "max_tokens": 1000, "temperature": 0.0, # Augmenté max_tokens pour séquences + pensée# Fortement recommandé
+
+            }
+
+            chat_completion = client.chat.completions.create(**chat_completion_params)
+
+            vlm_full_response_str = chat_completion.choices[0].message.content
+
+            print(f"[cyan]VLM Raw Response:[/]\n{vlm_full_response_str}")
+
+            parsed_vlm_data = parse_vlm_output_to_sequence(vlm_full_response_str) # Nouveau parseur
+
+
+
+            if parsed_vlm_data and "action_sequence" in parsed_vlm_data and "global_thought" in parsed_vlm_data:
+
+                global_thought = parsed_vlm_data["global_thought"]
+
+                action_sequence = parsed_vlm_data["action_sequence"]
+
+                
+
+                # Stocker la pensée globale et la séquence planifiée AVANT exécution
+
+                interaction_history.append((json.dumps(parsed_vlm_data), vlm_full_response_str))
+
+                
+
+                print(f"\n[green]Decoded Global Thought:[/green]\n{json.dumps(global_thought, indent=2)}")
+
+                print(f"[green]Planned Action Sequence ({len(action_sequence)} micro-actions):[/green]")
+
+                for i, micro_action in enumerate(action_sequence):
+
+                    print(f"  {i+1}. {micro_action.get('action_type')}: {micro_action.get('description', 'No description')}")
+
+
+
+                # Exécuter la séquence de micro-actions
+
+                sequence_fully_executed = True
+
+                for i, micro_action in enumerate(action_sequence):
+
+                    print(f"\n--- Executing micro-action {i+1}/{len(action_sequence)} ---")
+
+                    action_type = micro_action.get("action_type")
+
+                    description = micro_action.get("description", "")
+
+                    action_executed_successfully = True # Supposer le succès par défaut
+
+
+
+                    if action_type == "CLICK": action_click(micro_action["position"], description)
+
+                    elif action_type == "DOUBLE_CLICK": action_double_click(micro_action["position"], description)
+
+                    elif action_type == "INPUT": action_input_text(micro_action["value"], micro_action.get("position"), description) # position est optionnelle
+
+                    elif action_type == "SCROLL": action_scroll(micro_action["direction"], description)
+
+                    elif action_type == "PRESS_ENTER": action_press_enter(description)
+
+                    elif action_type == "KEY_PRESS": action_executed_successfully = action_key_press(micro_action["keys"], description)
+
+                    elif action_type == "PAUSE": action_pause(micro_action["duration_seconds"], description)
+
+                    elif action_type == "FINISHED":
+
+                        action_finished(micro_action.get("reason", "Task completed."), description)
+
+                        current_task_query = ""; interaction_history = []; current_step = 0
+
+                        sequence_fully_executed = False # Pour sortir de la boucle externe de step
+
+                        break # Sortir de la boucle des micro-actions
+
+                    else:
+
+                        print(f"[red]Error: Unknown micro_action_type in sequence: {action_type}[/red]")
+
+                        sequence_fully_executed = False; action_executed_successfully = False
+
+                        break
+
+                    
+
+                    if action_executed_successfully is False: # Si une action comme KEY_PRESS retourne False
+
+                        print(f"[red]Micro-action {action_type} reported failure. Halting sequence.[/red]")
+
+                        sequence_fully_executed = False
+
+                        break
+
+                    
+
+                    if action_type != "PAUSE" and action_type != "FINISHED": # Petite pause après la plupart des actions GUI
+
+                        time.sleep(0.99)
+
+                
+
+                if not sequence_fully_executed and current_task_query != "": # Si FINISHED a été appelé, current_task_query est vide
+
+                    print("[yellow]Action sequence was halted or finished. Proceeding to next step/task.[/yellow]")
+
+                    if action_type == "FINISHED": continue # Si FINISHED, la boucle while principale doit continuer pour redemander une tâche
+
+
+
+            else:
+
+                print("[red]VLM response invalid or unparsable into a valid sequence by agent's validation.[/red]")
+
+                error_thought_str = "My previous VLM output was not a valid JSON object or did not follow the required sequence format. I MUST output a single, valid JSON with 'global_thought' and 'action_sequence'."
+
+                interaction_history.append( (json.dumps({"action_type": "ERROR_FROM_AGENT", "detail": f"Invalid sequence JSON: {vlm_full_response_str[:100]}...", "global_thought": {"Previous Action Assessment":error_thought_str}}), vlm_full_response_str) )
+
+        
+
+        except Exception as e:
+
+            print(f"[bold red]Critical Error (API/Sequence Exec): {e}[/bold red]")
+
+            error_detail = str(e).replace('"', "'").replace('\n', ' ')[:100]
+
+            interaction_history.append( (json.dumps({"action_type": "ERROR_FROM_AGENT", "detail": f"Runtime err: {error_detail}", "global_thought": {"Previous Action Assessment":f"Critical error: {error_detail}"}}), "N/A_Exception") )
+
+
+
+if __name__ == "__main__":
+
+    if AUDIO_ENABLED:
+
+        audio_dir = "audio_feedback"; os.makedirs(audio_dir, exist_ok=True)
+
+        for f_name in ["ask.wav", "ok.wav", "ask_2.wav", "error.wav", "task_completed.wav"]:
+
+            f_path = os.path.join(audio_dir, f_name)
+
+            if not os.path.exists(f_path):
+
+                try: sf.write(f_path, [0.0]*int(0.1*16000), 16000, format='WAV', subtype='PCM_16')
+
+                except Exception as e: print(f"[yellow]Could not create dummy audio {f_name}: {e}[/yellow]")
+
+    main_agent_loop()
+
+
+
+
+Afficher le raisonnement
