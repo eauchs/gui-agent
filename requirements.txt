@@ -1,0 +1,8 @@
+openai
+pyautogui
+Pillow
+pynput
+rich
+sounddevice
+soundfile
+numpy
